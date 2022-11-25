@@ -14,7 +14,7 @@ from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedul
 from stable_baselines3.common.utils import obs_as_tensor, safe_mean
 from stable_baselines3.common.vec_env import VecEnv
 
-SelfOnPolicyAlgorithm = TypeVar("SelfOnPolicyAlgorithm", bound="OnPolicyAlgorithm")
+OnPolicyAlgorithmSelf = TypeVar("OnPolicyAlgorithmSelf", bound="OnPolicyAlgorithm")
 
 
 class OnPolicyAlgorithm(BaseAlgorithm):
@@ -38,6 +38,10 @@ class OnPolicyAlgorithm(BaseAlgorithm):
     :param sde_sample_freq: Sample a new noise matrix every n steps when using gSDE
         Default: -1 (only sample at the beginning of the rollout)
     :param tensorboard_log: the log location for tensorboard (if None, no logging)
+    :param create_eval_env: Whether to create a second environment that will be
+        used for evaluating the agent periodically. (Only available when passing string for the environment)
+        Caution, this parameter is deprecated and will be removed in the future.
+        Please use `EvalCallback` or a custom Callback instead.
     :param monitor_wrapper: When creating an environment, whether to wrap it
         or not in a Monitor wrapper.
     :param policy_kwargs: additional arguments to be passed to the policy on creation
@@ -64,6 +68,7 @@ class OnPolicyAlgorithm(BaseAlgorithm):
         use_sde: bool,
         sde_sample_freq: int,
         tensorboard_log: Optional[str] = None,
+        create_eval_env: bool = False,
         monitor_wrapper: bool = True,
         policy_kwargs: Optional[Dict[str, Any]] = None,
         verbose: int = 0,
@@ -82,6 +87,7 @@ class OnPolicyAlgorithm(BaseAlgorithm):
             device=device,
             use_sde=use_sde,
             sde_sample_freq=sde_sample_freq,
+            create_eval_env=create_eval_env,
             support_multi_env=True,
             seed=seed,
             tensorboard_log=tensorboard_log,
@@ -154,6 +160,18 @@ class OnPolicyAlgorithm(BaseAlgorithm):
             self.policy.reset_noise(env.num_envs)
 
         callback.on_rollout_start()
+        
+        import os
+        REPLAYS_FOLDER = r'C:\Users\Chris\Documents\AutoLeague\data'
+        dirs = os.listdir(REPLAYS_FOLDER)
+        latest_replay_integer = 0
+        dir_ints = [int(dir) if dir.isdigit() else 0 for dir in dirs]
+        latest_replay_integer = max(dir_ints)
+        new_folder_name = str(latest_replay_integer+1)
+
+        new_replay_path = os.path.join(REPLAYS_FOLDER, new_folder_name)
+        os.makedirs(new_replay_path)
+
 
         while n_steps < n_rollout_steps:
             if self.use_sde and self.sde_sample_freq > 0 and n_steps % self.sde_sample_freq == 0:
@@ -172,9 +190,61 @@ class OnPolicyAlgorithm(BaseAlgorithm):
             if isinstance(self.action_space, gym.spaces.Box):
                 clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)
 
+            CAPTURE = True
+            self.clipped_actions = None
+            # listen for mouse action
+            # create new clipped_actions
+            if CAPTURE and n_steps < 20:
+                from pynput.mouse import Listener
+                from pynput.mouse import Button, Controller
+                from pynput.keyboard import Listener as KBL
+
+                def on_press(key):
+                    my_dict = {
+                        "F" : 4,
+                        "Q" : 5,
+                        "W" : 6,
+                        "E" : 7,
+                        "R" : 8,
+                        "D" : 9
+                    }
+                    try:
+                        char = key.char.lower()
+                        if char in ["w", "q", "w", "d", "e", "r", "f"]:
+                            action_0 = my_dict[char.upper()]
+                            self.clipped_actions = np.array([[action_0, *Controller().position / 5]])
+                            return False
+                    except:
+                        pass
+                def on_click(x, y, button, pressed):
+                    if(pressed):
+                        x_0 = x / 5
+                        y_0 = y / 5
+                        action_0 = 0
+                        if button == Button.right:
+                            action_0 = 11
+                        else:
+                            action_0 = 10
+                        self.clipped_actions = np.array([[action_0, x_0, y_0]])
+
+                        return False
+                lst = Listener(on_click= on_click)
+                lstk = KBL(on_press=on_press)
+                lstk.start()
+                lst.start()
+                while type(self.clipped_actions) is not np.ndarray:
+                    # waiting for inputs
+                    pass
+                lstk.stop()
+                lst.stop()
+                clipped_actions = self.clipped_actions
+                actions = clipped_actions
+
+
             new_obs, rewards, dones, infos = env.step(clipped_actions)
 
             self.num_timesteps += env.num_envs
+
 
             # Give access to local variables
             callback.update_locals(locals())
@@ -201,14 +271,22 @@ class OnPolicyAlgorithm(BaseAlgorithm):
                         terminal_value = self.policy.predict_values(terminal_obs)[0]
                     rewards[idx] += self.gamma * terminal_value
 
+            # save data set
+            with open(new_replay_path + f"/{n_steps}.npy", "wb") as f:
+                np.save(f, self._last_obs)
+                np.save(f, actions)
+                np.save(f, rewards)
+                np.save(f, self._last_episode_starts)
+
             rollout_buffer.add(self._last_obs, actions, rewards, self._last_episode_starts, values, log_probs)
             self._last_obs = new_obs
             self._last_episode_starts = dones
 
+
         with th.no_grad():
             # Compute value for the last timestep
             values = self.policy.predict_values(obs_as_tensor(new_obs, self.device))
-
+        
         rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
 
         callback.on_rollout_end()
@@ -223,19 +301,27 @@ class OnPolicyAlgorithm(BaseAlgorithm):
         raise NotImplementedError
 
     def learn(
-        self: SelfOnPolicyAlgorithm,
+        self: OnPolicyAlgorithmSelf,
         total_timesteps: int,
         callback: MaybeCallback = None,
         log_interval: int = 1,
+        eval_env: Optional[GymEnv] = None,
+        eval_freq: int = -1,
+        n_eval_episodes: int = 5,
         tb_log_name: str = "OnPolicyAlgorithm",
+        eval_log_path: Optional[str] = None,
         reset_num_timesteps: bool = True,
         progress_bar: bool = False,
-    ) -> SelfOnPolicyAlgorithm:
+    ) -> OnPolicyAlgorithmSelf:
         iteration = 0
 
         total_timesteps, callback = self._setup_learn(
             total_timesteps,
+            eval_env,
             callback,
+            eval_freq,
+            n_eval_episodes,
+            eval_log_path,
             reset_num_timesteps,
             tb_log_name,
             progress_bar,
@@ -271,6 +357,135 @@ class OnPolicyAlgorithm(BaseAlgorithm):
         callback.on_training_end()
 
         return self
+
+
+    def collect_rollouts_from_dataset(
+        self,
+        env: VecEnv,
+        callback: BaseCallback,
+        rollout_buffer: RolloutBuffer,
+        dataset:None
+    ) -> bool:
+        """
+        Collect experiences using the current policy and fill a ``RolloutBuffer``.
+        The term rollout here refers to the model-free notion and should not
+        be used with the concept of rollout used in model-based RL or planning.
+
+        :param env: The training environment
+        :param callback: Callback that will be called at each step
+            (and at the beginning and end of the rollout)
+        :param rollout_buffer: Buffer to fill with rollouts
+        :param n_rollout_steps: Number of experiences to collect per environment
+        :return: True if function returned with at least `n_rollout_steps`
+            collected, False if callback terminated rollout prematurely.
+        """
+        assert self._last_obs is not None, "No previous observation was provided"
+        # Switch to eval mode (this affects batch norm / dropout)
+        self.policy.set_training_mode(False)
+
+        n_steps = 0
+        rollout_buffer.reset()
+        # Sample new weights for the state dependent exploration
+        if self.use_sde:
+            self.policy.reset_noise(env.num_envs)
+
+        callback.on_rollout_start()
+
+        for obs, actions, rewards, _last_episode_starts in dataset:
+            self._last_obs = obs
+
+            if self.use_sde and self.sde_sample_freq > 0 and n_steps % self.sde_sample_freq == 0:
+                # Sample a new noise matrix
+                self.policy.reset_noise(env.num_envs)
+
+            with th.no_grad():
+                # Convert to pytorch tensor or to TensorDict
+                obs_tensor = obs_as_tensor(self._last_obs, self.device)
+                actions_unused, values, log_probs = self.policy(obs_tensor)
+
+            self.num_timesteps += env.num_envs
+
+            # Give access to local variables
+            callback.update_locals(locals())
+            if callback.on_step() is False:
+                return False
+
+            n_steps += 1
+
+            if isinstance(self.action_space, gym.spaces.Discrete):
+                # Reshape in case of discrete action
+                actions = actions.reshape(-1, 1)
+
+            rollout_buffer.add(self._last_obs, actions, rewards, _last_episode_starts, values, log_probs)
+
+
+        with th.no_grad():
+            # Compute value for the last timestep
+            values = self.policy.predict_values(obs_as_tensor(obs, self.device))
+        
+        rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
+
+        callback.on_rollout_end()
+
+        return True
+
+    def learnFromDataset(
+        self: OnPolicyAlgorithmSelf,
+        total_epochs: int,
+        dataset = None,
+        callback: MaybeCallback = None,
+        eval_env: Optional[GymEnv] = None,
+        eval_freq: int = -1,
+        n_eval_episodes: int = 5,
+        tb_log_name: str = "OnPolicyAlgorithm",
+        eval_log_path: Optional[str] = None,
+        reset_num_timesteps: bool = True,
+        progress_bar: bool = False,
+    ) -> OnPolicyAlgorithmSelf:
+
+        total_timesteps, callback = self._setup_learn(
+            total_epochs,
+            eval_env,
+            callback,
+            eval_freq,
+            n_eval_episodes,
+            eval_log_path,
+            reset_num_timesteps,
+            tb_log_name,
+            progress_bar,
+        )
+
+        callback.on_training_start(locals(), globals())
+
+        while self.num_timesteps < total_timesteps:
+
+            continue_training = self.collect_rollouts_from_dataset(self.env, callback, self.rollout_buffer,dataset, n_rollout_steps=self.n_steps,)
+
+            if continue_training is False:
+                break
+
+            iteration += 1
+            self._update_current_progress_remaining(self.num_timesteps, total_timesteps)
+
+            # Display training infos
+            if log_interval is not None and iteration % log_interval == 0:
+                time_elapsed = max((time.time_ns() - self.start_time) / 1e9, sys.float_info.epsilon)
+                fps = int((self.num_timesteps - self._num_timesteps_at_start) / time_elapsed)
+                self.logger.record("time/iterations", iteration, exclude="tensorboard")
+                if len(self.ep_info_buffer) > 0 and len(self.ep_info_buffer[0]) > 0:
+                    self.logger.record("rollout/ep_rew_mean", safe_mean([ep_info["r"] for ep_info in self.ep_info_buffer]))
+                    self.logger.record("rollout/ep_len_mean", safe_mean([ep_info["l"] for ep_info in self.ep_info_buffer]))
+                self.logger.record("time/fps", fps)
+                self.logger.record("time/time_elapsed", int(time_elapsed), exclude="tensorboard")
+                self.logger.record("time/total_timesteps", self.num_timesteps, exclude="tensorboard")
+                self.logger.dump(step=self.num_timesteps)
+
+            self.train()
+
+        callback.on_training_end()
+
+        return self
+
 
     def _get_torch_save_params(self) -> Tuple[List[str], List[str]]:
         state_dicts = ["policy", "policy.optimizer"]
